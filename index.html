@@ -974,6 +974,7 @@ function renderContracts(){
     t.classList.toggle('active',t.dataset.filter===curFilter);
   });
 
+  var dupIds=markDuplicatesInList();
   var filtered=curFilter==='all'?C:C.filter(function(c){return c.status===curFilter;});
   var tbody=q('contracts-tbody');
   var empty=q('contracts-empty');
@@ -1022,6 +1023,14 @@ function renderContracts(){
       nm.onclick=(function(id){return function(){openContractDetail(id);};})(c.id);
       var cid=mk('div','cid',c.id);
       tdN.appendChild(nm);tdN.appendChild(cid);
+      // Duplicate badge
+      if(dupIds.indexOf(c.id)!==-1){
+        var dupBadge=mk('span','','⚠️ 疑似重复');
+        dupBadge.style.cssText='font-size:10px;padding:1px 7px;border-radius:8px;font-weight:600;background:#fff3e0;color:#f57f17;border:1px solid #ffe082;margin-top:3px;display:inline-block;cursor:pointer';
+        dupBadge.title='点击查看重复合同';
+        dupBadge.onclick=(function(n,p){return function(){showDupList(n,p);};})(c.name,c.party);
+        tdN.appendChild(dupBadge);
+      }
       // Notes — show if exists
       if(c.notes&&c.notes.trim()){
         var nt=mk('div','',c.notes.trim());
@@ -1110,10 +1119,24 @@ function saveContract(){
     type:getVal('cf-type'),status:getVal('cf-status'),amount:getVal('cf-amount').trim(),
     company:getVal('cf-company'),
     start:getVal('cf-start'),end:getVal('cf-end'),notes:getVal('cf-notes').trim(),versions:[]};
-  if(editCid){
-    var idx=C.findIndex(function(x){return x.id===editCid;});
-    if(idx!==-1){data.versions=C[idx].versions||[];C[idx]=data;}
-  } else {C.push(data);}
+
+  // Check for duplicates only when adding new contract (not editing)
+  if(!editCid){
+    showDuplicateWarning(name, party,
+      function(){ // proceed
+        C.push(data);
+        save(SK.C,C);closeModal('modal-contract-form');renderContracts();renderDashboard();
+      },
+      function(existing){ // merge
+        mergeIntoExisting(existing);
+      }
+    );
+    return;
+  }
+
+  // Editing existing contract — no duplicate check
+  var idx=C.findIndex(function(x){return x.id===editCid;});
+  if(idx!==-1){data.versions=C[idx].versions||[];C[idx]=data;}
   save(SK.C,C);closeModal('modal-contract-form');renderContracts();renderDashboard();
 }
 
@@ -2258,26 +2281,55 @@ function startDriveScan(){
   q('di-prog-count').textContent = '';
   q('di-bar').style.width = '5%';
 
-  // Call server-side /api/drive to list files
-  fetch('/api/drive', {
+  // Call Anthropic API to list Drive folder files
+  fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'list' })
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      mcp_servers: [{
+        type: 'url',
+        url: 'https://drivemcp.googleapis.com/mcp/v1',
+        name: 'google-drive'
+      }],
+      messages: [{
+        role: 'user',
+        content: 'List all PDF and Word files (mimeType contains pdf or word or document) in Google Drive folder with id "' + DRIVE_FOLDER_ID + '". Return ONLY a JSON array with objects {id, name, mimeType}. No markdown, no explanation.'
+      }]
+    })
   })
   .then(function(r){ return r.json(); })
   .then(function(data){
-    driveFiles = data.files || [];
+    // Parse file list from response
+    var text = data.content
+      ? data.content.filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('')
+      : '';
+    try {
+      var clean = text.replace(/```json|```/g,'').trim();
+      driveFiles = JSON.parse(clean);
+    } catch(e) {
+      // Try to extract JSON array from text
+      var m = text.match(/\[[\s\S]*\]/);
+      if(m) driveFiles = JSON.parse(m[0]);
+      else { alert('无法读取文件列表：' + text.slice(0,200)); diScanning=false; q('di-scan-btn').disabled=false; q('di-scan-btn').textContent='🔄 扫描文件'; return; }
+    }
+
     if(!driveFiles.length){
-      q('di-prog-text').textContent = data.message || '文件夹为空，请先上传合同文件到 Google Drive「合同管理」文件夹';
+      q('di-prog-text').textContent = '文件夹为空，请先上传合同文件到 Google Drive';
       q('di-bar').style.width = '100%';
       diScanning = false;
       q('di-scan-btn').disabled = false;
       q('di-scan-btn').textContent = '🔄 重新扫描';
       return;
     }
+
+    // Show file list
     renderDriveFileRows();
     q('di-bar').style.width = '10%';
     q('di-prog-text').textContent = 'AI 识别中...';
+
+    // Process files one by one
     driveResults = driveFiles.map(function(f){ return {file:f, status:'waiting', data:null}; });
     renderDriveFileRows();
     processNextDriveFile(0);
@@ -2320,24 +2372,47 @@ function processNextDriveFile(idx){
   q('di-bar').style.width = pct + '%';
   q('di-prog-count').textContent = (idx+1) + '/' + driveResults.length;
 
-  // Call server-side /api/drive to recognise file
-  fetch('/api/drive', {
+  // Call AI to read and recognize this file
+  fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'recognize', fileId: driveResults[idx].file.id, fileName: driveResults[idx].file.name })
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      mcp_servers: [{
+        type: 'url',
+        url: 'https://drivemcp.googleapis.com/mcp/v1',
+        name: 'google-drive'
+      }],
+      messages: [{
+        role: 'user',
+        content: 'Read the Google Drive file with id "' + driveResults[idx].file.id + '" and extract contract information. Return ONLY a JSON object with these fields: {"name":"合同名称","party":"对方当事人","type":"合同类型(服务协议/采购合同/租赁合同/劳务合同/保密协议/其他)","start":"签署日期YYYY-MM-DD or empty","end":"到期日期YYYY-MM-DD or empty","amount":"合同金额 or empty","notes":"简短备注 or empty"}. No markdown, no explanation.'
+      }]
+    })
   })
   .then(function(r){ return r.json(); })
   .then(function(data){
-    driveResults[idx].status = data.success === false ? 'error' : 'done';
-    driveResults[idx].data = data.data;
+    var text = data.content
+      ? data.content.filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('')
+      : '';
+    try {
+      var clean = text.replace(/```json|```/g,'').trim();
+      var m = clean.match(/\{[\s\S]*\}/);
+      var parsed = JSON.parse(m ? m[0] : clean);
+      driveResults[idx].status = 'done';
+      driveResults[idx].data = parsed;
+    } catch(e) {
+      driveResults[idx].status = 'error';
+      driveResults[idx].data = {name: driveResults[idx].file.name.replace(/\.(pdf|docx|doc)$/i,''), party:'', type:'其他', start:'', end:'', amount:'', notes:''};
+    }
     renderDriveFileRows();
-    setTimeout(function(){ processNextDriveFile(idx+1); }, 300);
+    setTimeout(function(){ processNextDriveFile(idx+1); }, 500);
   })
   .catch(function(){
     driveResults[idx].status = 'error';
     driveResults[idx].data = {name: driveResults[idx].file.name.replace(/\.(pdf|docx|doc)$/i,''), party:'', type:'其他', start:'', end:'', amount:'', notes:''};
     renderDriveFileRows();
-    setTimeout(function(){ processNextDriveFile(idx+1); }, 300);
+    setTimeout(function(){ processNextDriveFile(idx+1); }, 500);
   });
 }
 
@@ -2446,6 +2521,142 @@ function confirmDriveImport(){
   renderDashboard();
   renderContracts();
   alert('✅ 成功导入 ' + toImport.length + ' 份合同！');
+}
+
+
+
+// ── Duplicate Detection ──────────────────────────────────
+
+// Calculate similarity between two strings (0-1)
+function strSimilarity(a, b){
+  if(!a||!b) return 0;
+  a = a.toLowerCase().replace(/[^\u4e00-\u9fa5a-z0-9]/g,'');
+  b = b.toLowerCase().replace(/[^\u4e00-\u9fa5a-z0-9]/g,'');
+  if(a===b) return 1;
+  if(!a.length||!b.length) return 0;
+  // Check if one contains the other
+  if(a.includes(b)||b.includes(a)) return 0.85;
+  // Count common chars
+  var common=0;
+  var shorter=a.length<b.length?a:b;
+  var longer=a.length<b.length?b:a;
+  for(var i=0;i<shorter.length;i++){
+    if(longer.includes(shorter[i])) common++;
+  }
+  return common/longer.length;
+}
+
+// Find duplicate contracts for a given name+party
+function findDuplicates(name, party, excludeId){
+  var results=[];
+  C.forEach(function(c){
+    if(excludeId && c.id===excludeId) return;
+    var nameSim = strSimilarity(name, c.name);
+    var partySim = party && c.party ? strSimilarity(party, c.party) : 0.5;
+    var score = nameSim*0.7 + partySim*0.3;
+    if(score >= 0.65){
+      results.push({contract:c, score:Math.round(score*100)});
+    }
+  });
+  results.sort(function(a,b){return b.score-a.score;});
+  return results.slice(0,3); // top 3
+}
+
+// Show duplicate warning modal
+function showDuplicateWarning(name, party, onProceed, onMerge){
+  var dups = findDuplicates(name, party, editCid);
+  if(!dups.length){ onProceed(); return; }
+
+  // Build warning modal content
+  var overlay = document.createElement('div');
+  overlay.className = 'overlay';
+  overlay.id = 'modal-dup-warn';
+  overlay.style.zIndex = '200';
+
+  var box = document.createElement('div');
+  box.className = 'modal';
+  box.style.cssText = 'max-width:520px;width:95%';
+
+  var html = '<div class="modal-title" style="color:#f57f17">⚠️ 发现疑似重复合同</div>';
+  html += '<div style="font-size:13px;color:#666;margin:12px 0 16px">系统检测到以下合同与你正在添加的合同可能重复：</div>';
+
+  dups.forEach(function(d){
+    html += '<div style="background:#fff8e1;border:1.5px solid #ffe082;border-radius:8px;padding:12px 14px;margin-bottom:10px;display:flex;align-items:center;gap:12px">';
+    html += '<span style="font-size:20px">📄</span>';
+    html += '<div style="flex:1">';
+    html += '<div style="font-size:13px;font-weight:600;color:#1c2a1f">'+d.contract.name+'</div>';
+    html += '<div style="font-size:11px;color:#8a9e92;margin-top:2px">'+d.contract.id+' · '+d.contract.party+'</div>';
+    html += '</div>';
+    html += '<span style="font-size:11px;font-weight:700;color:#f57f17;background:#fff3e0;padding:2px 8px;border-radius:8px">相似度 '+d.score+'%</span>';
+    html += '</div>';
+  });
+
+  html += '<div style="font-size:12px;color:#666;margin:14px 0 10px">你想怎么处理？</div>';
+  html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+  html += '<button class="btn btn-ghost" id="dup-cancel">取消</button>';
+  if(dups.length===1){
+    html += '<button class="btn" style="background:#ff8f00;color:#fff" id="dup-merge">添加为新版本</button>';
+  }
+  html += '<button class="btn" style="background:#c62828;color:#fff" id="dup-proceed">仍然新建合同</button>';
+  html += '</div>';
+
+  box.innerHTML = html;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  // Show
+  setTimeout(function(){ overlay.classList.add('open'); }, 10);
+
+  function closeWarn(){
+    overlay.classList.remove('open');
+    setTimeout(function(){ document.body.removeChild(overlay); }, 200);
+  }
+
+  document.getElementById('dup-cancel').onclick = function(){ closeWarn(); };
+  document.getElementById('dup-proceed').onclick = function(){ closeWarn(); onProceed(); };
+
+  var mergeBtn = document.getElementById('dup-merge');
+  if(mergeBtn){
+    mergeBtn.onclick = function(){
+      closeWarn();
+      onMerge(dups[0].contract);
+    };
+  }
+}
+
+// Merge new upload into existing contract as a new version
+function showDupList(name, party){
+  var dups = findDuplicates(name, party, null);
+  if(!dups.length){ alert('没有找到重复合同'); return; }
+  var msg = '以下合同与「'+name+'」疑似重复：\n\n';
+  dups.forEach(function(d){
+    msg += '· '+d.contract.name+' ('+d.score+'%)\n  '+d.contract.id+'\n\n';
+  });
+  alert(msg);
+}
+
+function mergeIntoExisting(existingContract){
+  // Open the existing contract detail and trigger add version
+  closeModal('modal-contract-form');
+  openContractDetail(existingContract.id);
+  setTimeout(function(){
+    openVersionForm();
+    // Pre-fill note
+    setVal('vf-note', '合并自重复合同');
+  }, 300);
+}
+
+// Show duplicate badges in contract list
+function markDuplicatesInList(){
+  var seen={};
+  var dupIds=[];
+  C.forEach(function(c){
+    var key = c.name.toLowerCase().replace(/\s/g,'').slice(0,10)+'_'+c.party.toLowerCase().replace(/\s/g,'').slice(0,6);
+    if(seen[key]) dupIds.push(c.id, seen[key]);
+    else seen[key]=c.id;
+  });
+  dupIds = dupIds.filter(function(v,i,a){return a.indexOf(v)===i;});
+  return dupIds;
 }
 
 
